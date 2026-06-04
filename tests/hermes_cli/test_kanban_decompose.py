@@ -345,3 +345,50 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+
+
+def test_decompose_reroutes_when_required_capability_missing(kanban_home):
+    """Decomposer should not assign file-writing work to low-permission profiles."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="create an artifact", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "artifact requires file write",
+        "tasks": [
+            {
+                "title": "write artifact",
+                "body": "Create a durable file under HermesWork.",
+                "assignee": "safe",
+                "required_capabilities": ["file_write"],
+                "parents": [],
+            },
+        ],
+    })
+
+    patches = _patch_list_profiles(["safe", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "default_assignee": "dev",
+                    "profile_capabilities": {
+                        "safe": ["review"],
+                        "dev": ["file_write", "terminal"],
+                    },
+                }
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.assignee == "dev"
+    assert "required capabilities" in child.body

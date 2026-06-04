@@ -544,7 +544,7 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
-        return {
+        body = {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
@@ -560,6 +560,11 @@ def get_task(
                 )
             ],
         }
+        try:
+            body["root_status"] = kanban_db.build_root_status_snapshot(conn, task_id)
+        except Exception:
+            log.debug("failed to build root status snapshot for %s", task_id, exc_info=True)
+        return body
     finally:
         conn.close()
 

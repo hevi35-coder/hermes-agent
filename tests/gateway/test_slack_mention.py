@@ -51,6 +51,7 @@ from gateway.platforms.slack import SlackAdapter  # noqa: E402
 # ---------------------------------------------------------------------------
 
 BOT_USER_ID = "U_BOT_123"
+BOT_ID = "B_BOT_123"
 CHANNEL_ID = "C0AQWDLHY9M"
 OTHER_CHANNEL_ID = "C9999999999"
 
@@ -71,6 +72,7 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
     adapter.config = PlatformConfig(enabled=True, extra=extra)
     adapter._bot_user_id = BOT_USER_ID
     adapter._team_bot_user_ids = {}
+    adapter._team_bot_ids = {}
     return adapter
 
 
@@ -303,6 +305,31 @@ def test_dm_always_processed_regardless_of_setting():
 def test_mentioned_message_always_processed():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(adapter, mentioned=True, text="what's up") is True
+
+
+def test_bot_id_style_mention_processed_and_stripped():
+    """Slack events that contain a bot/app id mention (<@B...>) must not black-hole.
+
+    Real Slack mentions normally arrive as the bot user id (<@U...>), but the
+    gateway has seen user-visible messages containing the bot id (<@B...>).  In
+    require_mention channels those were previously ignored before any visible
+    ACK, making the request look lost.
+    """
+    adapter = _make_adapter(require_mention=True)
+    adapter._team_bot_user_ids = {"T1": BOT_USER_ID}
+    adapter._team_bot_ids = {"T1": BOT_ID}
+
+    assert "<@B_BOT_123>" in adapter._slack_bot_mention_tokens("T1")
+    assert "<@U_BOT_123>" in adapter._slack_bot_mention_tokens("T1")
+
+    routing_text = "<@B_BOT_123> hello"
+    is_mentioned = any(token in routing_text for token in adapter._slack_bot_mention_tokens("T1"))
+    assert is_mentioned is True
+
+    text = routing_text
+    for token in adapter._slack_bot_mention_tokens("T1"):
+        text = text.replace(token, "")
+    assert text.strip() == "hello"
 
 
 def test_thread_reply_with_active_session_processed():

@@ -1065,6 +1065,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    last_digest_at INTEGER NOT NULL DEFAULT 0,
+    last_digest_hash TEXT,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -1676,6 +1678,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "last_digest_at" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "last_digest_at",
+                "last_digest_at INTEGER NOT NULL DEFAULT 0",
+            )
+        if "last_digest_hash" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "last_digest_hash", "last_digest_hash TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -1801,6 +1814,8 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_digest_at INTEGER NOT NULL DEFAULT 0,"
+        " last_digest_hash TEXT,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -2368,6 +2383,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
+        _inherit_notify_subs_from_parent(conn, parent_id=parent_id, child_id=child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
@@ -2638,6 +2654,454 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
             )
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Root status snapshots
+# ---------------------------------------------------------------------------
+
+_ROOT_STATUS_ORDER = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived")
+
+
+def _task_status_item(task: Task, *, parent_chain: Optional[list[str]] = None) -> dict[str, Any]:
+    """Return a compact, JSON-serialisable task summary for status views."""
+    return {
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "assignee": task.assignee,
+        "tenant": task.tenant,
+        "priority": task.priority,
+        "parent_chain": list(parent_chain or []),
+    }
+
+
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the newest blocked-event reason for ``task_id`` if present."""
+    row = conn.execute(
+        """
+        SELECT payload
+          FROM task_events
+         WHERE task_id = ? AND kind = 'blocked'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return ""
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return ""
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return str(reason).strip() if reason else ""
+
+
+def classify_blocker(reason: str) -> dict[str, str]:
+    """Classify a block reason into a stable user-facing schema.
+
+    ``action_needed`` preserves the older compact values used by existing
+    Slack text (user/operator/none). ``blocker_reason`` is the machine-readable
+    category, and ``action_owner`` says who must act from the requester's
+    perspective. Missing tools/profile permissions are system recovery work,
+    not a user question.
+    """
+    lower = (reason or "").casefold()
+    category = "unknown"
+    action_needed = "none"
+    action_owner = "none"
+    checks = (
+        ("needs_user_input", "user", "user", ("needs_user_input", "user_input", "clarification", "ambiguous_scope")),
+        ("missing_tool_capability", "operator", "system", ("missing_tool_capability", "tool", "profile", "capability")),
+        ("permission_denied", "operator", "system", ("permission_denied", "permission")),
+        ("external_dependency", "operator", "system", ("external_dependency", "dependency", "rate limit", "quota")),
+        ("validation_failed", "operator", "system", ("validation_failed", "test failed", "tests failed", "validation")),
+        ("worker_failure", "operator", "system", ("worker_failure", "crashed", "timed_out", "gave_up")),
+    )
+    for cat, needed, owner, tokens in checks:
+        if any(token in lower for token in tokens):
+            category = cat
+            action_needed = needed
+            action_owner = owner
+            break
+    return {
+        "blocker_reason": category,
+        "action_needed": action_needed,
+        "action_owner": action_owner,
+    }
+
+
+def classify_block_action_needed(reason: str) -> str:
+    """Backward-compatible action-needed value for existing callers."""
+    return classify_blocker(reason)["action_needed"]
+
+
+def _find_root_task_id(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the user-facing root for status snapshots.
+
+    Notify subscriptions are anchored to the Slack/Telegram thread the user can
+    see.  Dependency-style decomposition can link prerequisite work as parents
+    of that user-facing card, so a subscribed card remains the root even when
+    it has parent links.
+    """
+    if conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone():
+        return task_id
+    current = task_id
+    seen: set[str] = set()
+    while current not in seen:
+        seen.add(current)
+        parents = parent_ids(conn, current)
+        if not parents:
+            return current
+        current = parents[0]
+    return task_id
+
+
+def _collect_descendant_ids(conn: sqlite3.Connection, root_id: str) -> list[tuple[str, list[str]]]:
+    """Return ``[(task_id, parent_chain)]`` for root and descendants."""
+    out: list[tuple[str, list[str]]] = []
+    queue: list[tuple[str, list[str]]] = [(root_id, [])]
+    seen: set[str] = set()
+    while queue:
+        task_id, chain = queue.pop(0)
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        out.append((task_id, chain))
+        for child_id in child_ids(conn, task_id):
+            queue.append((child_id, [*chain, task_id]))
+    return out
+
+
+def build_root_status_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Build a bounded, deterministic status snapshot for a root request.
+
+    ``task_id`` may point at the root card or any descendant. The returned
+    shape is intentionally small and JSON-serialisable so CLI/gateway status
+    messages do not need an LLM call or raw task bodies/results.
+    """
+    requested = get_task(conn, task_id)
+    if not requested:
+        raise ValueError(f"unknown task {task_id}")
+    root_id = _find_root_task_id(conn, task_id)
+    root = get_task(conn, root_id)
+    if not root:
+        raise ValueError(f"unknown root task {root_id}")
+
+    pairs = _collect_descendant_ids(conn, root_id)
+    tasks: list[tuple[Task, list[str]]] = []
+    for tid, chain in pairs:
+        t = get_task(conn, tid)
+        if t:
+            tasks.append((t, chain))
+
+    counts = {status: 0 for status in _ROOT_STATUS_ORDER}
+    by_status: dict[str, list[dict[str, Any]]] = {status: [] for status in _ROOT_STATUS_ORDER}
+    blocked: list[dict[str, Any]] = []
+    queued: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    completed: list[dict[str, Any]] = []
+
+    for task, chain in tasks:
+        counts[task.status] = counts.get(task.status, 0) + 1
+        item = _task_status_item(task, parent_chain=chain)
+        by_status.setdefault(task.status, []).append(item)
+        if task.status == "blocked":
+            reason = _latest_block_reason(conn, task.id)
+            item = {
+                **item,
+                "reason": reason,
+                **classify_blocker(reason),
+            }
+            blocked.append(item)
+        elif task.status in {"todo", "scheduled", "triage", "ready"}:
+            queued.append(item)
+        elif task.status in {"running", "review"}:
+            active.append(item)
+        elif task.status == "done":
+            completed.append(item)
+
+    open_count = sum(counts.get(s, 0) for s in counts if s not in {"done", "archived"})
+    return {
+        "requested_task_id": task_id,
+        "root": _task_status_item(root),
+        "total_tasks": len(tasks),
+        "open_tasks": open_count,
+        "counts": counts,
+        "blocked": blocked,
+        "queued": queued,
+        "active": active,
+        "completed": completed,
+        "by_status": by_status,
+    }
+
+
+def format_root_status_compact(snapshot: dict[str, Any], *, max_items: int = 3) -> str:
+    """Format a root snapshot for Slack/CLI in a bounded number of lines."""
+    root = snapshot.get("root") or {}
+    counts = snapshot.get("counts") or {}
+    interesting = [
+        f"{status}={int(counts.get(status, 0) or 0)}"
+        for status in ("blocked", "running", "ready", "todo", "scheduled", "done")
+        if int(counts.get(status, 0) or 0)
+    ]
+    lines = [
+        f"Root {root.get('id', '-')}: {str(root.get('title', ''))[:100]}",
+        f"상태: total={snapshot.get('total_tasks', 0)} open={snapshot.get('open_tasks', 0)} "
+        + (" ".join(interesting) if interesting else "(empty)"),
+    ]
+
+    blocked = list(snapshot.get("blocked") or [])
+    if blocked:
+        for item in blocked[:max_items]:
+            action = {
+                "user": "사용자 답변 필요",
+                "operator": "시스템/운영자 조치 필요",
+                "none": "사용자 조치 필요 없음",
+            }.get(item.get("action_needed"), "사용자 조치 필요 없음")
+            reason = str(item.get("reason") or "").strip()
+            reason_bits = f" — {reason[:120]}" if reason else ""
+            lines.append(f"차단: {item.get('id')} {action}{reason_bits}")
+        if len(blocked) > max_items:
+            lines.append(f"차단 항목 {len(blocked) - max_items}개 더 있음")
+    else:
+        queued_count = len(snapshot.get("queued") or [])
+        active_count = len(snapshot.get("active") or [])
+        if queued_count or active_count:
+            lines.append(f"진행/대기: active={active_count} queued={queued_count}")
+        else:
+            lines.append("열린 하위 작업 없음")
+    return "\n".join(lines[:8])
+
+
+def _root_queue_items(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Queued items that are useful to surface to a root requester.
+
+    The root card itself is often ``todo`` while decomposition is open; listing
+    it back to the user as queued work is redundant. Prefer descendant cards,
+    but fall back to the root when it is the only queued item.
+    """
+    root_id = ((snapshot.get("root") or {}).get("id") or "")
+    queued = list(snapshot.get("queued") or [])
+    descendants = [item for item in queued if item.get("id") != root_id]
+    return descendants or queued
+
+
+def format_root_queue_digest(snapshot: dict[str, Any], *, max_items: int = 5) -> str:
+    """Format a bounded user-facing digest of queued/todo work under a root."""
+    root = snapshot.get("root") or {}
+    items = _root_queue_items(snapshot)
+    if not items:
+        return ""
+    counts = snapshot.get("counts") or {}
+    queued_count = len(items)
+    status_bits = [
+        f"{status}={int(counts.get(status, 0) or 0)}"
+        for status in ("triage", "todo", "scheduled", "ready", "running", "blocked")
+        if int(counts.get(status, 0) or 0)
+    ]
+    lines = [
+        f"Kanban 대기 작업 요약 — Root {root.get('id', '-')}: {str(root.get('title', ''))[:90]}",
+        f"대기/할 일 {queued_count}개" + (f" ({' '.join(status_bits)})" if status_bits else ""),
+    ]
+    for item in items[:max_items]:
+        chain = [str(x) for x in item.get("parent_chain") or []]
+        parent_text = f" 부모: {' > '.join(chain)}" if chain else ""
+        assignee = f" @{item.get('assignee')}" if item.get("assignee") else ""
+        lines.append(
+            f"- {item.get('id')} [{item.get('status')}] {str(item.get('title') or '')[:90]}{assignee}{parent_text}"
+        )
+    if len(items) > max_items:
+        lines.append(f"… 대기 작업 {len(items) - max_items}개 더 있음")
+    lines.append("필요하면 root 작업 상태를 조회해 우선순위/부모 작업을 확인하세요.")
+    return "\n".join(lines[:10])
+
+
+def _root_queue_digest_hash(snapshot: dict[str, Any]) -> str:
+    """Stable hash for deciding whether a queued-work digest is still current."""
+    payload = {
+        "root": (snapshot.get("root") or {}).get("id"),
+        "open_tasks": snapshot.get("open_tasks"),
+        "counts": snapshot.get("counts") or {},
+        "queued": [
+            {
+                "id": item.get("id"),
+                "status": item.get("status"),
+                "title": item.get("title"),
+                "assignee": item.get("assignee"),
+                "parent_chain": item.get("parent_chain") or [],
+            }
+            for item in _root_queue_items(snapshot)
+        ],
+        "blocked": [
+            {
+                "id": item.get("id"),
+                "reason": item.get("reason"),
+                "action_needed": item.get("action_needed"),
+            }
+            for item in (snapshot.get("blocked") or [])
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def claim_root_queue_digest_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    min_interval_seconds: int = 3600,
+    now: Optional[int] = None,
+) -> tuple[bool, dict[str, Any], str]:
+    """Claim a rate-limited queued-work digest for a root subscription.
+
+    Returns ``(claimed, snapshot, text)``. Only root subscriptions emit queue
+    digests; inherited child subscriptions remain terminal-event notifiers so
+    one Slack/Telegram thread does not get N duplicate summaries.
+    """
+    ts = int(now if now is not None else time.time())
+    # Queue digests are emitted only by the subscription row that represents
+    # the user-facing thread itself.  Inherited descendant rows stay silent;
+    # dependency-style roots may have prerequisite parents, so do not reject a
+    # subscribed card just because it has ancestors.
+    if _has_ancestor_notify_sub(
+        conn,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    ):
+        return False, {}, ""
+    snapshot = build_root_status_snapshot(conn, task_id)
+    text = format_root_queue_digest(snapshot)
+    if not text:
+        return False, snapshot, ""
+    digest_hash = _root_queue_digest_hash(snapshot)
+    interval = max(0, int(min_interval_seconds))
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_digest_at, last_digest_hash FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return False, snapshot, ""
+        last_at = int(row["last_digest_at"] or 0) if "last_digest_at" in row.keys() else 0
+        if last_at and interval and ts - last_at < interval:
+            return False, snapshot, ""
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_digest_at = ?, last_digest_hash = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (ts, digest_hash, task_id, platform, chat_id, thread_id or ""),
+        )
+    return True, snapshot, text
+
+
+def reset_root_queue_digest_claim_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> None:
+    """Clear a pre-send digest claim so a failed gateway send can retry."""
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_digest_at = 0, last_digest_hash = NULL "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
+
+
+def _matching_notify_task_ids_for_source(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> list[str]:
+    """Return task ids whose notify subscription matches a chat/thread."""
+    if not platform or not chat_id:
+        return []
+    rows = conn.execute(
+        "SELECT task_id FROM kanban_notify_subs "
+        "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+        (platform, chat_id, thread_id or ""),
+    ).fetchall()
+    return [str(row["task_id"]) for row in rows]
+
+
+def record_feedback_for_notify_thread(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    text: str,
+    user_id: Optional[str] = None,
+    author: str = "user-feedback",
+) -> Optional[str]:
+    """Record user feedback against the root Kanban task for a notify thread.
+
+    Returns the root task id when a matching subscription exists, otherwise
+    ``None``.  Feedback is stored both as a human-readable comment and as a
+    machine-readable ``user_feedback_received`` event so workers/notifiers can
+    consume it without parsing Slack text.
+    """
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return None
+    task_ids = _matching_notify_task_ids_for_source(
+        conn,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    if not task_ids:
+        return None
+    root_id = next(
+        (
+            tid for tid in task_ids
+            if not _has_ancestor_notify_sub(
+                conn,
+                task_id=tid,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        ),
+        task_ids[0],
+    )
+    now = int(time.time())
+    comment = (
+        f"User feedback from {platform}/{chat_id}"
+        f" thread {thread_id or '<none>'}"
+        f" user {user_id or '<unknown>'}:\n{clean_text}"
+    )
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (root_id, author, comment, now),
+        )
+        _append_event(
+            conn,
+            root_id,
+            "user_feedback_received",
+            {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id or "",
+                "user_id": user_id or "",
+                "text": clean_text,
+            },
+        )
+    return root_id
 
 
 def _append_event(
@@ -6951,6 +7415,88 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+def _descendant_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return all descendants of ``task_id`` in dependency order.
+
+    Root chat subscriptions are copied down this graph so child cards remain
+    visible in the user's original Slack/Telegram thread.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    stack = [task_id]
+    while stack:
+        node = stack.pop()
+        rows = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+            (node,),
+        ).fetchall()
+        for row in rows:
+            child = row["child_id"]
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+            stack.append(child)
+    return out
+
+
+def _insert_notify_sub_row(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    user_id: Optional[str],
+    notifier_profile: Optional[str],
+    created_at: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, created_at),
+    )
+    if notifier_profile:
+        # Self-heal legacy rows that predate notifier ownership by backfilling
+        # only when the existing value is unset.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (notifier_profile IS NULL OR notifier_profile = '')
+            """,
+            (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+        )
+
+
+def _inherit_notify_subs_from_parent(
+    conn: sqlite3.Connection, *, parent_id: str, child_id: str
+) -> None:
+    """Copy a parent's gateway subscriptions onto a child subtree."""
+    rows = conn.execute(
+        "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (parent_id,)
+    ).fetchall()
+    if not rows:
+        return
+    now = int(time.time())
+    for row in rows:
+        for target_id in [child_id] + _descendant_ids(conn, child_id):
+            _insert_notify_sub_row(
+                conn,
+                task_id=target_id,
+                platform=row["platform"],
+                chat_id=row["chat_id"],
+                thread_id=row["thread_id"],
+                user_id=row["user_id"],
+                notifier_profile=row["notifier_profile"],
+                created_at=now,
+            )
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -6965,25 +7511,26 @@ def add_notify_sub(
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
     now = int(time.time())
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+        _insert_notify_sub_row(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            notifier_profile=notifier_profile,
+            created_at=now,
         )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+        for descendant_id in _descendant_ids(conn, task_id):
+            _insert_notify_sub_row(
+                conn,
+                task_id=descendant_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                notifier_profile=notifier_profile,
+                created_at=now,
             )
 
 
@@ -7016,6 +7563,67 @@ def remove_notify_sub(
     return cur.rowcount > 0
 
 
+def _ancestor_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return all ancestors of ``task_id`` nearest-first."""
+    out: list[str] = []
+    seen: set[str] = set()
+    queue = list(parent_ids(conn, task_id))
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        out.append(current)
+        queue.extend(pid for pid in parent_ids(conn, current) if pid not in seen)
+    return out
+
+
+def _has_ancestor_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """True if an ancestor already owns this exact chat/thread subscription."""
+    ancestors = _ancestor_ids(conn, task_id)
+    if not ancestors:
+        return False
+    placeholders = ",".join("?" * len(ancestors))
+    row = conn.execute(
+        f"""
+        SELECT 1 FROM kanban_notify_subs
+         WHERE task_id IN ({placeholders})
+           AND platform = ? AND chat_id = ? AND thread_id = ?
+         LIMIT 1
+        """,
+        (*ancestors, platform, chat_id, thread_id or ""),
+    ).fetchone()
+    return row is not None
+
+
+def _notify_related_task_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return the scoped request/dependency closure for a subscription.
+
+    A subscription should hear about the subscribed card, its normal child
+    subtree, and prerequisite ancestors used by dependency-style decomposition.
+    It must NOT walk from an ancestor back down into siblings/other roots,
+    because separate Slack threads may share a prerequisite and must not leak
+    each other's task titles, blockers, or artifacts.
+    """
+    if not task_id:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for current in [task_id, *_ancestor_ids(conn, task_id), *_descendant_ids(conn, task_id)]:
+        if current in seen:
+            continue
+        seen.add(current)
+        out.append(current)
+    return out
+
+
 def unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -7039,13 +7647,28 @@ def unseen_events_for_sub(
     if row is None:
         return 0, []
     cursor = int(row["last_event_id"])
+    # If this chat/thread also subscribes to an ancestor/root task, the
+    # ancestor row tails the whole connected request graph.  The descendant row
+    # is kept for visibility/backward compatibility, but must stay silent or a
+    # child terminal event is delivered once per inherited row.
+    if _has_ancestor_notify_sub(
+        conn,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    ):
+        return cursor, []
     kind_list = list(kinds) if kinds else None
+    related_ids = _notify_related_task_ids(conn, task_id) or [task_id]
     q = (
-        "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+        "SELECT * FROM task_events WHERE task_id IN ("
+        + ",".join("?" * len(related_ids))
+        + ") AND id > ? "
         + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
         + "ORDER BY id ASC"
     )
-    params: list[Any] = [task_id, cursor]
+    params: list[Any] = [*related_ids, cursor]
     if kind_list:
         params.extend(kind_list)
     rows = conn.execute(q, params).fetchall()

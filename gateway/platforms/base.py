@@ -3627,6 +3627,8 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
+                if self._busy_ack_enabled():
+                    await self._send_visible_ack(event, self._busy_ack_text(mode="queue"))
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -3638,6 +3640,8 @@ class BasePlatformAdapter(ABC):
                     self._busy_text_debounce_seconds,
                 )
                 await self._queue_text_debounce(session_key, event)
+                if self._busy_ack_enabled():
+                    await self._send_visible_ack(event, self._busy_ack_text(mode="queue"))
             else:
                 logger.debug(
                     "[%s] New message while session %s is active — queuing follow-up "
@@ -3651,6 +3655,8 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
+                if self._busy_ack_enabled():
+                    await self._send_visible_ack(event, self._busy_ack_text(mode="queue"))
             return  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
@@ -3662,6 +3668,71 @@ class BasePlatformAdapter(ABC):
         # mapping atomically so stale-lock detection works.
         self._start_session_processing(event, session_key)
     
+    def _bool_extra_or_env(self, extra_key: str, env_name: str, default: bool = False) -> bool:
+        """Resolve a boolean platform extra/env flag with tolerant parsing."""
+        raw = os.environ.get(env_name)
+        if raw is None:
+            raw = self.config.extra.get(extra_key)
+        if raw is None:
+            return default
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _visible_ack_enabled(self) -> bool:
+        """Whether to send a user-visible receipt before long processing."""
+        default = self.platform == Platform.SLACK
+        return self._bool_extra_or_env(
+            "immediate_ack", "HERMES_GATEWAY_IMMEDIATE_ACK", default,
+        )
+
+    def _busy_ack_enabled(self) -> bool:
+        """Whether follow-up text during an active run gets a visible receipt."""
+        default = self.platform == Platform.SLACK
+        return self._bool_extra_or_env(
+            "busy_ack", "HERMES_GATEWAY_BUSY_ACK", default,
+        )
+
+    def _visible_ack_text(self, event: MessageEvent) -> str:
+        """Short receipt shown before the agent has produced a real answer."""
+        return (
+            "접수했어요. 요청을 분석 중입니다. "
+            "작업이 길어지면 이 thread에 중간 상태를 공유하겠습니다."
+        )
+
+    def _busy_ack_text(self, *, mode: str = "queue") -> str:
+        """Short receipt for user feedback sent while a session is busy."""
+        if mode == "steer":
+            return "의견 접수했어요. 현재 진행 중인 작업의 다음 단계에 바로 반영하겠습니다."
+        if mode == "starting":
+            return "의견 접수했어요. 에이전트가 시작 중이라 시작 직후 반영하겠습니다."
+        return "의견 접수했어요. 현재 작업이 끝나면 다음 단계에 반영하겠습니다."
+
+    async def _send_visible_ack(self, event: MessageEvent, content: str) -> None:
+        """Best-effort visible receipt; failures must not block processing."""
+        try:
+            _thread_meta = _thread_metadata_for_source(
+                event.source, _reply_anchor_for_event(event)
+            )
+            await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=content,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=_thread_meta,
+                max_retries=0,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("[%s] visible ACK failed: %s", self.name, exc)
+
+    def _should_send_visible_ack_for_event(self, event: MessageEvent) -> bool:
+        if not self._visible_ack_enabled():
+            return False
+        if event.message_type == MessageType.COMMAND:
+            return False
+        if (event.text or "").strip().startswith("/"):
+            return False
+        if not getattr(event, "source", None) or not event.source.chat_id:
+            return False
+        return True
+
     @staticmethod
     def _get_human_delay() -> float:
         """
@@ -3737,6 +3808,12 @@ class BasePlatformAdapter(ABC):
         
         try:
             await self._run_processing_hook("on_processing_start", event)
+
+            if self._should_send_visible_ack_for_event(event):
+                delay = _float_env("HERMES_GATEWAY_ACK_DELAY_SECONDS", 0.0)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._send_visible_ack(event, self._visible_ack_text(event))
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)

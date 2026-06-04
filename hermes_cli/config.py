@@ -1827,6 +1827,12 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Root queue/todo digest cadence for messaging subscriptions, in
+        # seconds. 0 disables the rate limit (every notifier tick may send if
+        # the root queued-state hash is still relevant); negative disables
+        # digests. Env var HERMES_KANBAN_QUEUE_DIGEST_INTERVAL_SECONDS remains
+        # a legacy override when this key is absent from older configs.
+        "queue_digest_interval_seconds": 3600,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

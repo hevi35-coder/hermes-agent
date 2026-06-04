@@ -2193,3 +2193,28 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+def test_task_detail_includes_root_status_snapshot(client):
+    root = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Slack root", "assignee": "pm"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Needs input", "assignee": "worker"},
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, child["id"], reason="needs_user_input: pick an account")
+        kb.link_tasks(conn, root["id"], child["id"])
+    finally:
+        conn.close()
+
+    r = client.get(f"/api/plugins/kanban/tasks/{child['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["root_status"]["root"]["id"] == root["id"]
+    assert data["root_status"]["counts"]["blocked"] == 1
+    assert data["root_status"]["blocked"][0]["action_owner"] == "user"

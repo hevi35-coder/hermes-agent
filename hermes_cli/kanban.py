@@ -417,6 +417,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restrict to tasks with this current_step_key",
     )
 
+    # --- status ---
+    p_status = sub.add_parser(
+        "status",
+        help="Show a root/request-level status snapshot for a task tree",
+    )
+    p_status.add_argument("task_id")
+    p_status.add_argument("--json", action="store_true")
+    p_status.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include grouped task lists after the compact summary",
+    )
+
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
@@ -935,6 +948,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "swarm":    _cmd_swarm,
         "list":     _cmd_list,
         "ls":       _cmd_list,
+        "status":   _cmd_status,
         "show":     _cmd_show,
         "assign":   _cmd_assign,
         "reclaim":  _cmd_reclaim,
@@ -1453,6 +1467,36 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     for t in tasks:
         print(_fmt_task_line(t))
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        snapshot = kb.build_root_status_snapshot(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        return 0
+
+    print(kb.format_root_status_compact(snapshot))
+    if getattr(args, "verbose", False):
+        for label, key in (
+            ("Blocked", "blocked"),
+            ("Active", "active"),
+            ("Queued", "queued"),
+            ("Completed", "completed"),
+        ):
+            items = snapshot.get(key) or []
+            if not items:
+                continue
+            print(f"\n{label} ({len(items)}):")
+            for item in items:
+                assignee = item.get("assignee") or "-"
+                reason = item.get("reason")
+                suffix = f" — {str(reason)[:120]}" if reason else ""
+                print(
+                    f"  {item.get('id')} {item.get('status')} @{assignee} "
+                    f"{str(item.get('title') or '')[:100]}{suffix}"
+                )
     return 0
 
 
@@ -2748,6 +2792,7 @@ _SLASH_KANBAN_HELP = """\
 Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
   `show <id>`           Task details + comments + events
+  `status <id>`         Root/request-level status snapshot
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment

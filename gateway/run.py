@@ -4911,6 +4911,103 @@ class GatewayRunner:
         except Exception:
             return "default"
 
+    @staticmethod
+    def _looks_like_kanban_feedback_reply(text: str) -> bool:
+        """Heuristic for short choice/checkpoint replies like AACC."""
+        stripped = (text or "").strip()
+        if not stripped or stripped.startswith("/"):
+            return False
+        compact = re.sub(r"[\s,;/.-]+", "", stripped.upper())
+        if re.fullmatch(r"[A-D]{1,16}", compact):
+            return True
+        if re.fullmatch(r"[1-9][0-9]{0,1}([+&][1-9][0-9]{0,1}){0,7}", compact):
+            return True
+        return False
+
+    async def _capture_kanban_thread_feedback(self, event: MessageEvent) -> bool:
+        """Capture short Slack/Kanban checkpoint replies against the root task."""
+        source = getattr(event, "source", None)
+        text = (getattr(event, "text", None) or "").strip()
+        if source is None or not text:
+            return False
+        if not self._looks_like_kanban_feedback_reply(text):
+            return False
+        platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        platform = platform.lower()
+        if platform != "slack":
+            return False
+        chat_id = str(source.chat_id or "")
+        thread_id = str(source.thread_id or "")
+        if not chat_id or not thread_id:
+            return False
+
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.debug("kanban feedback capture skipped: kanban_db not importable")
+            return False
+
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
+
+        def _record() -> Optional[str]:
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            seen_db_paths: set[str] = set()
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    resolved = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
+                except Exception:
+                    resolved = f"slug:{slug}"
+                if resolved in seen_db_paths:
+                    continue
+                seen_db_paths.add(resolved)
+                try:
+                    conn = _kb.connect(board=slug)
+                except Exception:
+                    continue
+                try:
+                    task_id = _kb.record_feedback_for_notify_thread(
+                        conn,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        text=text,
+                        user_id=getattr(source, "user_id", None),
+                        author="slack-user-feedback",
+                    )
+                    if task_id:
+                        return task_id
+                finally:
+                    conn.close()
+            return None
+
+        task_id = await asyncio.to_thread(_record)
+        if not task_id:
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is not None:
+            reply_anchor = self._reply_anchor_for_event(event)
+            thread_meta = self._thread_metadata_for_source(source, reply_anchor)
+            try:
+                await adapter._send_with_retry(
+                    chat_id=chat_id,
+                    content=f"{text} 답변을 Kanban root {task_id}에 기록했습니다. 다음 단계에 반영하겠습니다.",
+                    reply_to=reply_anchor,
+                    metadata=thread_meta,
+                )
+            except Exception as exc:
+                logger.debug("kanban feedback ACK failed for %s: %s", task_id, exc)
+        logger.info(
+            "kanban_checkpoint_reply_received: platform=%s chat=%s thread=%s task=%s profile=%s",
+            platform, chat_id, thread_id, task_id, notifier_profile,
+        )
+        return True
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -5048,8 +5145,77 @@ class GatewayRunner:
                                     kinds=TERMINAL_KINDS,
                                 )
                                 if not events:
+                                    try:
+                                        from hermes_cli.config import load_config as _load_runtime_config
+                                        _runtime_cfg = _load_runtime_config() or {}
+                                        _kanban_cfg = _runtime_cfg.get("kanban", {}) if isinstance(_runtime_cfg, dict) else {}
+                                        if "queue_digest_interval_seconds" in _kanban_cfg:
+                                            digest_interval = int(_kanban_cfg.get("queue_digest_interval_seconds") or 0)
+                                        else:
+                                            digest_interval = int(
+                                                os.environ.get(
+                                                    "HERMES_KANBAN_QUEUE_DIGEST_INTERVAL_SECONDS",
+                                                    "3600",
+                                                )
+                                            )
+                                    except (TypeError, ValueError):
+                                        digest_interval = 3600
+                                    except Exception:
+                                        try:
+                                            digest_interval = int(
+                                                os.environ.get(
+                                                    "HERMES_KANBAN_QUEUE_DIGEST_INTERVAL_SECONDS",
+                                                    "3600",
+                                                )
+                                            )
+                                        except ValueError:
+                                            digest_interval = 3600
+                                    if digest_interval < 0:
+                                        continue
+                                    try:
+                                        claimed_digest, _snapshot, digest_text = _kb.claim_root_queue_digest_for_sub(
+                                            conn,
+                                            task_id=sub["task_id"],
+                                            platform=sub["platform"],
+                                            chat_id=sub["chat_id"],
+                                            thread_id=sub.get("thread_id") or "",
+                                            min_interval_seconds=digest_interval,
+                                        )
+                                    except Exception as digest_exc:
+                                        logger.debug(
+                                            "kanban notifier: queue digest skipped for %s on board %s: %s",
+                                            sub.get("task_id"), slug, digest_exc,
+                                        )
+                                        claimed_digest, digest_text = False, ""
+                                    if not claimed_digest or not digest_text:
+                                        continue
+                                    task = _kb.get_task(conn, sub["task_id"])
+                                    deliveries.append({
+                                        "sub": sub,
+                                        "old_cursor": old_cursor,
+                                        "cursor": cursor,
+                                        "events": [],
+                                        "task": task,
+                                        "parent_tasks": [],
+                                        "root_status_text": "",
+                                        "digest_text": digest_text,
+                                        "board": slug,
+                                    })
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                parent_tasks = []
+                                root_status_text = ""
+                                try:
+                                    for parent_id in _kb.parent_ids(conn, sub["task_id"]):
+                                        parent = _kb.get_task(conn, parent_id)
+                                        if parent:
+                                            parent_tasks.append(parent)
+                                    snapshot = _kb.build_root_status_snapshot(conn, sub["task_id"])
+                                    root_status_text = _kb.format_root_status_compact(snapshot)
+                                except Exception:
+                                    parent_tasks = parent_tasks or []
+                                    root_status_text = ""
+                                event_tasks = {ev.task_id: _kb.get_task(conn, ev.task_id) for ev in events}
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -5060,6 +5226,9 @@ class GatewayRunner:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "event_tasks": event_tasks,
+                                    "parent_tasks": parent_tasks,
+                                    "root_status_text": root_status_text,
                                     "board": slug,
                                 })
                         finally:
@@ -5070,7 +5239,10 @@ class GatewayRunner:
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
+                    parent_tasks = d.get("parent_tasks") or []
+                    root_status_text = d.get("root_status_text") or ""
                     board_slug = d.get("board")
+                    digest_text = d.get("digest_text") or ""
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -5096,12 +5268,36 @@ class GatewayRunner:
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
+                    if digest_text:
+                        metadata: dict[str, Any] = {}
+                        if sub.get("thread_id"):
+                            metadata["thread_id"] = sub["thread_id"]
+                        try:
+                            await adapter.send(sub["chat_id"], digest_text, metadata=metadata)
+                            logger.debug(
+                                "kanban notifier: delivered queue digest for %s to %s/%s on board %s",
+                                sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban notifier: queue digest send failed for %s on %s: %s",
+                                sub["task_id"], platform_str, exc,
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_reset_digest_claim,
+                                sub,
+                                board_slug,
+                            )
+                        continue
                     for ev in d["events"]:
                         kind = ev.kind
+                        event_task = (d.get("event_tasks") or {}).get(ev.task_id) or task
+                        event_title = (event_task.title if event_task else ev.task_id)[:120]
+                        event_id = ev.task_id or sub["task_id"]
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
+                        who = (event_task.assignee if event_task and event_task.assignee else None)
                         tag = f"@{who} " if who else ""
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
@@ -5116,38 +5312,70 @@ class GatewayRunner:
                             if payload_summary:
                                 h = payload_summary.strip().splitlines()[0][:200]
                                 handoff = f"\n{h}"
-                            elif task and task.result:
-                                r = task.result.strip().splitlines()[0][:160]
+                            elif event_task and event_task.result:
+                                r = event_task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"✔ {tag}Kanban {event_id} done"
+                                f" — {event_title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
+                            raw_reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                                raw_reason = str(ev.payload["reason"])
+                                reason = f": {raw_reason[:160]}"
+                            parent_context = ""
+                            if parent_tasks:
+                                parent_bits = [
+                                    f"{p.id} — {p.title[:80]}" for p in parent_tasks[:3]
+                                ]
+                                parent_context = "\n부모/root 요청: " + "; ".join(parent_bits)
+                            action_line = "\n사용자 조치 필요 없음"
+                            if raw_reason and any(
+                                token in raw_reason.lower()
+                                for token in (
+                                    "missing_tool_capability",
+                                    "permission",
+                                    "tool",
+                                    "profile",
+                                )
+                            ):
+                                action_line = (
+                                    "\n사용자 조치 필요 없음"
+                                    "\n시스템/운영자 조치 필요: 작업을 적절한 권한/도구를 가진 profile로 재배정하거나 worker toolset을 수정해야 합니다."
+                                )
+                            elif raw_reason and any(
+                                token in raw_reason.lower()
+                                for token in ("needs_user_input", "user_input", "clarification")
+                            ):
+                                action_line = "\n사용자 답변 필요: 차단 사유의 질문/요청에 답하면 작업을 재개할 수 있습니다."
+                            root_context = f"\n{root_status_text}" if root_status_text else ""
+                            msg = (
+                                f"⏸ {tag}Kanban {event_id} blocked{reason}"
+                                f" — {event_title}"
+                                f"{parent_context}{action_line}{root_context}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"✖ {tag}Kanban {event_id} gave up "
+                                f"after repeated spawn failures — {event_title}{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"✖ {tag}Kanban {event_id} worker crashed "
+                                f"— {event_title} (pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"⏱ {tag}Kanban {event_id} timed out "
+                                f"— {event_title} (max_runtime={limit}s); will retry"
                             )
                         else:
                             continue
@@ -5265,6 +5493,23 @@ class GatewayRunner:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_reset_digest_claim(
+        self, sub: dict, board: Optional[str] = None,
+    ) -> None:
+        """Sync helper: clear a failed pre-send root queue digest claim."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.reset_root_queue_digest_claim_for_sub(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
             )
         finally:
             conn.close()
@@ -7178,6 +7423,16 @@ class GatewayRunner:
                     # itself will produce the next user-facing message.
                     return ""
 
+        # Capture short replies to Kanban progress/checkpoint messages after
+        # pending clarify replies have had first chance to unblock an active
+        # agent turn.  This covers Slack choice answers like "AACC" in root
+        # Kanban threads without stealing ordinary clarify/checkpoint answers.
+        try:
+            if await self._capture_kanban_thread_feedback(event):
+                return ""
+        except Exception as _kanban_feedback_err:
+            logger.debug("Kanban thread feedback capture skipped: %s", _kanban_feedback_err)
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else
@@ -7567,6 +7822,11 @@ class GatewayRunner:
                         event,
                         merge_text=True,
                     )
+                    if hasattr(adapter, "_busy_ack_enabled") and adapter._busy_ack_enabled():
+                        await adapter._send_visible_ack(
+                            event,
+                            adapter._busy_ack_text(mode="starting"),
+                        )
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():

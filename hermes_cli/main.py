@@ -6258,6 +6258,11 @@ def cmd_slack(args):
 
         return slack_manifest_command(args)
 
+    if sub == "doctor":
+        from hermes_cli.slack_cli import slack_doctor_command
+
+        return slack_doctor_command(args)
+
     print(f"Unknown slack subcommand: {sub}", file=sys.stderr)
     return 1
 
@@ -12061,6 +12066,36 @@ def main():
         action="store_true",
         help="Emit only the features.slash_commands array (for merging "
         "into an existing manifest manually).",
+    )
+    slack_doctor = slack_sub.add_parser(
+        "doctor",
+        help="Diagnose Slack gateway readiness without printing secrets",
+        description=(
+            "Run Slack gateway checks: bot/app auth, Socket Mode app-token "
+            "connectivity, optional target-channel membership/history/write, "
+            "expected manifest scope checklist, and recent inbound Slack log state."
+        ),
+    )
+    slack_doctor.add_argument(
+        "--channel",
+        default=None,
+        help="Target Slack channel ID to check. Defaults to SLACK_HOME_CHANNEL when set.",
+    )
+    slack_doctor.add_argument(
+        "--send-test-message",
+        action="store_true",
+        help="Actually call chat.postMessage in the target channel to verify write access.",
+    )
+    slack_doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of text.",
+    )
+    slack_doctor.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="Slack API timeout in seconds (default: 15).",
     )
     slack_parser.set_defaults(func=cmd_slack)
 

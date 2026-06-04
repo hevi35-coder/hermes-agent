@@ -314,6 +314,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
+        self._team_bot_ids: Dict[str, str] = {}               # team_id → bot_id (B...)
         self._channel_team: Dict[str, str] = {}                # channel_id → team_id
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
@@ -576,11 +577,14 @@ class SlackAdapter(BasePlatformAdapter):
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
+                bot_id = auth_response.get("bot_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
+                if bot_id:
+                    self._team_bot_ids[team_id] = bot_id
 
                 # First token sets the primary bot_user_id (backward compat)
                 if self._bot_user_id is None:
@@ -754,6 +758,21 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
+
+    def _slack_bot_mention_tokens(self, team_id: str = "") -> set[str]:
+        """Return Slack mention tokens that should address this bot.
+
+        Slack normally emits bot mentions as the bot *user* id (``<@U...>``),
+        but users can see/copy the app/bot id (``<@B...>``) from help text,
+        legacy logs, or malformed manual mentions. Treat both as addressing the
+        bot so a visible ``@Hermes`` mention does not silently black-hole.
+        """
+        ids = {
+            self._team_bot_user_ids.get(team_id, "") if team_id else "",
+            self._team_bot_ids.get(team_id, "") if team_id else "",
+            self._bot_user_id or "",
+        }
+        return {f"<@{bot_id}>" for bot_id in ids if bot_id}
 
     async def send(
         self,
@@ -1957,8 +1976,9 @@ class SlackAdapter(BasePlatformAdapter):
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        bot_mention_tokens = self._slack_bot_mention_tokens(team_id)
         routing_text = original_text or ""
-        is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        is_mentioned = bool(bot_mention_tokens and any(token in routing_text for token in bot_mention_tokens))
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -1996,7 +2016,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         if is_mentioned:
             # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            for token in bot_mention_tokens:
+                text = text.replace(token, "")
+            text = text.strip()
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would

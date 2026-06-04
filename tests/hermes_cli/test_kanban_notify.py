@@ -223,6 +223,64 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     )
 
 
+@pytest.mark.asyncio
+async def test_root_subscription_delivers_blocked_dependency(kanban_home):
+    """A Slack/root request subscription must notify when a child/dependency blocks."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="root Slack request", assignee="orchestrator")
+        child = kb.create_task(conn, title="needs web research", assignee="research")
+        # Kanban links model prerequisites as parent -> child. Auto-decompose
+        # therefore links child work as a dependency/parent of the root card.
+        kb.link_tasks(conn, child, root)
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="slack",
+            chat_id="C123",
+            thread_id="171000.000100",
+            notifier_profile="gateway",
+        )
+        kb.block_task(conn, child, reason="needs_user_input: choose A/B")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "gateway"
+
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.SLACK: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_called_once()
+    sent = fake_adapter.send.call_args
+    assert sent.args[0] == "C123"
+    assert "needs web research" in sent.args[1]
+    assert "needs_user_input" in sent.args[1]
+    assert sent.kwargs.get("metadata") == {"thread_id": "171000.000100"}
+
+
 # ---------------------------------------------------------------------------
 # Regression: gateway watchers must not double-init the kanban DB.
 #

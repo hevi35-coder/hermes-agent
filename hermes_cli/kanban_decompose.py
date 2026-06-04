@@ -70,6 +70,7 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "required_capabilities": ["<optional: file_write|terminal|web|browser|messaging|review|research>"],
         "parents": [<int>, ...]
       },
       ...
@@ -89,6 +90,11 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Set required_capabilities when the task needs concrete tools or durable
+    side effects. Examples: file_write for creating/editing artifacts,
+    terminal for commands/tests, web/browser for current research, messaging
+    for delivery. Do not assign work to a profile whose listed capabilities
+    do not cover the requirement.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -214,6 +220,64 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return "default"
 
 
+def _profile_capabilities_from_config(cfg: dict, profile_name: str) -> set[str]:
+    """Return configured capabilities for a profile.
+
+    Operators can provide ``kanban.profile_capabilities.<profile>`` as a
+    lightweight routing contract. Values are intentionally coarse-grained and
+    user-facing, not raw tool names.
+    """
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    caps_map = kanban_cfg.get("profile_capabilities") if isinstance(kanban_cfg, dict) else None
+    if not isinstance(caps_map, dict):
+        return set()
+    raw = caps_map.get(profile_name) or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    return {str(x).strip().casefold() for x in raw if str(x).strip()}
+
+
+def _required_capabilities(entry: dict) -> set[str]:
+    raw = entry.get("required_capabilities") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    return {str(x).strip().casefold() for x in raw if str(x).strip()}
+
+
+def _choose_capable_assignee(
+    chosen: str,
+    required: set[str],
+    *,
+    default_assignee: str,
+    valid_names: set[str],
+    cfg: dict,
+) -> tuple[str, bool]:
+    """Return an assignee that satisfies configured required capabilities.
+
+    If no profile has explicit matching capabilities we keep the already valid
+    choice rather than guessing. If the chosen profile is explicitly configured
+    and lacks a requirement, prefer default_assignee when it is capable, then
+    any capable profile from the roster.
+    """
+    if not required:
+        return chosen, False
+    chosen_caps = _profile_capabilities_from_config(cfg, chosen)
+    if chosen_caps and required.issubset(chosen_caps):
+        return chosen, False
+    default_caps = _profile_capabilities_from_config(cfg, default_assignee)
+    if default_assignee in valid_names and default_caps and required.issubset(default_caps):
+        return default_assignee, default_assignee != chosen
+    for name in sorted(valid_names):
+        caps = _profile_capabilities_from_config(cfg, name)
+        if caps and required.issubset(caps):
+            return name, name != chosen
+    return chosen, False
+
+
 def _build_roster() -> tuple[list[dict], set[str]]:
     """Return (roster_for_prompt, valid_assignee_names).
 
@@ -239,13 +303,15 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     return roster, valid
 
 
-def _format_roster(roster: list[dict]) -> str:
+def _format_roster(roster: list[dict], cfg: Optional[dict] = None) -> str:
     if not roster:
         return "  (no profiles installed — decomposer cannot route work)"
     lines = []
     for entry in roster:
         tag = "" if entry["has_description"] else " ⚠ undescribed"
-        lines.append(f"  - {entry['name']}{tag}: {entry['description']}")
+        caps = _profile_capabilities_from_config(cfg or {}, str(entry["name"]))
+        caps_text = f" capabilities={','.join(sorted(caps))}" if caps else ""
+        lines.append(f"  - {entry['name']}{tag}: {entry['description']}{caps_text}")
     return "\n".join(lines)
 
 
@@ -319,7 +385,7 @@ def decompose_task(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
-        roster=_format_roster(roster),
+        roster=_format_roster(roster, cfg),
         default_assignee=default_assignee,
     )
 
@@ -416,6 +482,14 @@ def decompose_task(
             default_assignee=default_assignee,
             valid_names=valid_names,
         )
+        required = _required_capabilities(entry)
+        chosen, rerouted_for_capability = _choose_capable_assignee(
+            chosen,
+            required,
+            default_assignee=default_assignee,
+            valid_names=valid_names,
+            cfg=cfg,
+        )
         if (
             isinstance(assignee, str)
             and assignee.strip()
@@ -426,6 +500,17 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
+        if rerouted_for_capability:
+            logger.info(
+                "decompose: task %s child %d rerouted to %r for required capabilities %s",
+                task_id, idx, chosen, sorted(required),
+            )
+            cap_note = (
+                "\n\nRouting note: required capabilities "
+                + ", ".join(sorted(required))
+                + f"; assigned to {chosen}."
+            )
+            body = (body.strip() + cap_note).strip()
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
